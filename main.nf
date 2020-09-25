@@ -10,21 +10,22 @@ nextflow.enable.dsl = 2
 process CONTIGS_FROM_IDS {
 	tag {"${meta.id}"}
     container 'nakor/virus_extraction'
-	publishDir params.outdir, mode: "copy"
+	publishDir "${params.outdir}/viral-fasta", mode: "copy"
 
 	input:
     tuple val(meta), path(fasta), path(ids)
 
 	output:
-    tuple val(meta), path("viral-contigs_${meta.id}.fasta")
+    tuple val(meta), path("viral_contigs-${meta.id}.fasta")
     
 	script:
     def ids_all_tools = ids.join(' ')
     """
-    python contigs_from_ids.py \ 
-        --fasta $fasta \ 
+    contigs_from_ids.py \
+        --fasta $fasta \
         --ids $ids_all_tools \
-        --output viral-contigs_${meta.id}.fasta
+        --output viral_contigs-${meta.id}.fasta \
+        --prefix "${meta.id}!"
     """
 }
 
@@ -32,28 +33,22 @@ process CONTIGS_FROM_IDS {
 // need to add a prefix (e.g. sample name) in case the contig ids
 // are the same in the different assemblies
 process MERGE_CONTIGS {
-    publishDir "${params.outdir}/cluster_genomes", mode: 'copy'
+    publishDir "${params.outdir}/cluster-genomes", mode: 'copy'
     publishDir "${params.outdir}", mode: 'copy', pattern: '*.fna'
     container 'nakor/votu_table'
 
     input:
     path f
-    val samples
 
     output:
     path '*', emit: all
     path '*.fna', emit: fasta
     path '*.clstr', emit: clusters    
 
-    when:
-    f.size() > 1
-
-    script:
+    script:    
     """
     #!/usr/bin/env bash
-
-    bash add_prefix.sh ${samples.join(' ')}
-    cat *_prefixed.fasta > all_contigs.fasta && rm -f *prefixed.fasta
+    cat *.fasta > all_contigs.fasta
     Cluster_genomes.pl -f all_contigs.fasta -c 80 -i 95
     rm -f all_contigs.fasta
     """
@@ -96,13 +91,13 @@ process BWA_MEM {
         | samtools sort -@ $task.cpus -o ${meta}.bam
 
     # Bam indexing
-    samtools index ${meta}.bam ${meta}.bai
+    samtools index -@ $task.cpus ${meta}.bam ${meta}.bai
     """
 }
 
 
 process MAKE_COVERAGE_TABLE {
-    publishDir "${params.outdir}", mode: 'copy'
+    publishDir "${params.outdir}/bwa", mode: 'copy'
     container 'nakor/votu_table'
 
     input:
@@ -113,19 +108,21 @@ process MAKE_COVERAGE_TABLE {
     path "coverage_table.tsv"
 
     script:
+    def sorted_bam = bam.sort{it.getSimpleName()}
+    def samples = sorted_bam.collect{it.getSimpleName()}
     """
     #!/usr/bin/env bash
-
-    samtools depth ${bam.sort().join(' ')} > coverage_table.tsv
+    echo "contig pos ${samples.join(" ")}" | sed 's/ /\\t/g' > coverage_table.tsv
+    samtools depth $sorted_bam >> coverage_table.tsv
+    
     """
 }
 
 process MAKE_ABUNDANCE_TABLE {
-    publishDir "${params.outdir}", mode: 'copy'
+    publishDir "${params.outdir}/tables", mode: 'copy'
     container 'nakor/votu_table'
 
     input:
-    val samples
     path table
     path fasta
 
@@ -134,16 +131,15 @@ process MAKE_ABUNDANCE_TABLE {
 
     script:
     """
-    python compute_table.py \
+    compute_table.py \
         --fasta ${fasta} \
-        --coverage ${table} \
-        --samples ${samples.join(' ')}
+        --coverage ${table}
     """
 }
 
 
 process SUBSET_ABUNDANCE_TABLE {
-    publishDir "${params.outdir}", mode: 'copy'
+    publishDir "${params.outdir}/tables", mode: 'copy'
     container 'nakor/votu_table'
 
     input:
@@ -157,8 +153,8 @@ process SUBSET_ABUNDANCE_TABLE {
 
     script:
     """
-    for tool in ${tools_list.join(' ')}; do
-        python subset_abundance_table.py \
+    for tool in ${tools.join(' ')}; do
+        subset_abundance_table.py \
             --name \$tool \
             --ids *\${tool}*.txt \
             --clusters ${clusters} \
@@ -170,27 +166,29 @@ process SUBSET_ABUNDANCE_TABLE {
 
 workflow v_otu_table{
     take:
-    sample_names
     contigs
     vir_ids
     reads
 
     main:
-
     // subset viral contigs
     // concatenates contigs from all samples
     viral_assembly = CONTIGS_FROM_IDS(
         contigs.combine(vir_ids, by: 0)
     )
 
-    // merge assemblies from multiple samples
-    merged_assembly = MERGE_CONTIGS(
-        viral_assembly.collect{it[1]}, //
-        sample_names
-    )
+    if (params.coassembly) {
+        merged_assembly = viral_assembly.map{it[1]}
+        clusters = file('empty')
+    } else {        
+        // merge assemblies from multiple samples
+        merging = MERGE_CONTIGS(viral_assembly.collect{it[1]})
+        merged_assembly = merging.fasta
+        clusters = merging.clusters   
+    }
 
     // align reads against clustered assembly
-    ref = BWA_INDEX(merged_assembly.fasta)
+    ref = BWA_INDEX(merged_assembly).first() // to convert to value channel
     alignments = BWA_MEM(reads, ref)
 
     // compute coverage
@@ -201,29 +199,33 @@ workflow v_otu_table{
 
     // into abundance table
     abundance_table = MAKE_ABUNDANCE_TABLE(
-        sample_names,
         coverage_table,
-        merged_assembly.fasta
+        merged_assembly
     )
 
-    // abundance table for each virus identification software
+    tools = vir_ids
+        .map{it[1]}
+        .flatten()
+        .map{"${it.getSimpleName().tokenize('-')[0]}"}
+        .unique()
+        .collect()
+
     SUBSET_ABUNDANCE_TABLE(
-        vir_ids.collect{it[0]}.unique(),
+        tools,
         vir_ids.collect{it[1]},
         abundance_table,
-        merged_assembly.clusters
+        clusters
     )
 }
 
 workflow {
-    // contig id must be the same as virus ids files
-    contigs = Channel.fromPath(params.fasta).map{[[id: "${it.getSimpleName()}"], it]}
-    // vir_ids filename are {tool}_contigs_{assembly_prefix}.txt
+    // contig id are sample names
+    contigs = Channel.fromPath(params.fasta).map{[[id: "${it.getSimpleName().tokenize('-')[-1]}"], it]}
+    // vir_ids filename are {tool}-XXX-{sample_name}.txt
     vir_ids = Channel.fromPath(params.ids)
-        .map{[[id: "${it.getSimpleName().tokenize('_')[2..-1].join('_')}"], it]}
+        .map{[[id: "${it.getSimpleName().tokenize('-')[-1]}"], it]}
         .groupTuple() // emits tuple(sample, files)
     reads = Channel.fromFilePairs(params.fastq)
-    
-    sample_names = reads.collect{it[0]}.sort()
-    v_otu_table(contigs, vir_ids, reads, sample_names)
+
+    v_otu_table(contigs, vir_ids, reads)
 }
